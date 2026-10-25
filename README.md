@@ -115,6 +115,7 @@ aus der Spec (jede Zelle genau einmal).
   zu viele Einträge, verboten bei Graustufen)
 - doppelte PLTE/tRNS (Spec: darf nur einmal vorkommen)
 - Paletten-Index hinter der PLTE-Länge (bricht mit Meldung, nicht mit IndexError)
+- überschüssige Bytes nach dem zlib-Stream im IDAT (stdlib verwirft sie still)
 
 ## 3 Fallen, die dieser Testlauf gelehrt hat (TESTED)
 
@@ -139,6 +140,6 @@ aus der Spec (jede Zelle genau einmal).
 - IMPLEMENTED: Decoder (alle Farbarten/Bittiefen, non-interlaced UND Adam7),
   CRC-Check, tRNS/tEXt, PPM-Export, CLI, Review-Fixes (doppelte PLTE/tRNS
   abgelehnt, Paletten-Index-Bounds, CLI fängt auch OSError).
-- TESTED: 57/57 unittests (`python -m unittest test_pngparser`), ruff clean,
+- TESTED: 58/58 unittests (`python -m unittest test_pngparser`), ruff clean,
   basedpyright 0 Errors / 0 Warnungen, CLI-Feldtest mit generiertem sowie
-  gezielt korruptiertem PNG (CRC-Fehler-Fall: Exit 1).
+  gezielt korruptiertem PNG (CRC-Fehler-Fall: Exit 1, Fehler auf stderr).

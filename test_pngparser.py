@@ -701,14 +701,30 @@ class IoAndExportTests(unittest.TestCase):
 
     def test_main_missing_file_reports_clean_error(self) -> None:
         # Nur PngError zu fangen wäre zu wenig: auch OSError (z. B. fehlende Datei)
-        # muss zu einer klaren Meldung statt Traceback führen.
+        # muss zu einer klaren Meldung statt Traceback führen — auf STDERR
+        # (POSIX-Konvention), damit `python pngparser.py x > log` nicht zugemüllt wird.
         with tempfile.TemporaryDirectory() as tmp:
             missing = os.path.join(tmp, "gibts-nicht.png")
-            buf = io.StringIO()
-            with contextlib.redirect_stdout(buf):
+            out, err = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
                 code = pngparser.main([missing])
         self.assertEqual(code, 1)
-        self.assertIn("FEHLER", buf.getvalue())
+        self.assertIn("FEHLER", err.getvalue())
+        self.assertNotIn("FEHLER", out.getvalue())
+
+    def test_idat_junk_after_zlib_stream_raises(self) -> None:
+        # zlib.decompress() verwirft trailing Bytes kommentarlos; ein strenger
+        # Parser meldet sie (Spec: zlib-Stream endet am IDAT-Ende).
+        ihdr = struct.pack(">IIBBBBB", 1, 1, 8, 2, 0, 0, 0)
+        comp = zlib.compress(b"\x00\xff\x00\x00") + b"junk"
+        parts = [
+            SIGNATURE,
+            make_chunk(b"IHDR", ihdr),
+            make_chunk(b"IDAT", comp),
+            make_chunk(b"IEND", b""),
+        ]
+        with self.assertRaisesRegex(PngFormatError, "zlib-Stream"):
+            decode_png(b"".join(parts))
 
 
 if __name__ == "__main__":

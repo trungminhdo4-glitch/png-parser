@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import struct
+import sys
 import zlib
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -564,9 +565,14 @@ def decode_png(data: bytes, *, verify_crc: bool = True) -> PngImage:
             "Kein IDAT-Chunk: ohne Bild-Daten ist das kein lesbares PNG"
         )
     try:
-        raw = zlib.decompress(b"".join(idats))
+        stream = zlib.decompressobj()
+        raw = stream.decompress(b"".join(idats)) + stream.flush()
     except zlib.error as exc:
         raise PngFormatError(f"IDAT: deflate-Daten sind korrupt ({exc})") from exc
+    if stream.unused_data:
+        raise PngFormatError(
+            f"IDAT: {len(stream.unused_data)} überschüssige Bytes nach dem zlib-Stream"
+        )
 
     ch = CHANNELS_PER_COLOR_TYPE[ihdr.color_type]
     if ihdr.interlace == 1:
@@ -670,7 +676,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         img = load(path, verify_crc=not no_crc)
     except (PngError, OSError) as exc:
-        print(f"FEHLER: {exc}")
+        print(f"FEHLER: {exc}", file=sys.stderr)
         return 1
     print(f"Datei: {path}")
     print(f"  Maße: {img.width} x {img.height}")
