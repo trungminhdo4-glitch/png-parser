@@ -7,7 +7,7 @@ offline — gebaut als Reverse-Engineering-Übung für das eigene Formatverstän
 | Datei | Inhalt |
 | --- | --- |
 | `pngparser.py` | Parser + PPM-Export + CLI (`python pngparser.py bild.png`) |
-| `test_pngparser.py` | 46 unittests mit eigenem Mini-Encoder als Fixture-Generator |
+| `test_pngparser.py` | 57 unittests mit eigenem Mini-Encoder als Fixture-Generator |
 | `pyrightconfig.json` | basedpyright-Konfig (zwei Strikt-Regeln gedämpft) |
 | `LICENSE` | MIT |
 
@@ -22,8 +22,8 @@ img.save_ppm("out.ppm")                       # ohne Lib sichtbar machen
 ```
 
 Unterstützt: Farbarten 0/2/3/4/6, Bittiefen 1/2/4/8/16, alle 5 Filtertypen,
-mehrfache IDATs, tRNS, tEXt, CRC32-Prüfung. *Nicht* unterstützt:
-Adam7-Interlace → `PngUnsupportedError` (gute Übung, selbst zu bauen).
+**Adam7-Interlace** (7 Pässe, pass-lokaler Filterkontext), mehrfache IDATs,
+tRNS, tEXt, CRC32-Prüfung.
 
 ## CLI
 
@@ -87,6 +87,25 @@ Lern-Fall: vorletztes Byte `a=0, b=10, c=0` — `p=10`, `pb=0` minimal → **b**
 **7. tRNS:** Grau (2 B) / RGB (6 B) = Schlüsselfarbe auf **RAW-Ebene**
 (vor Skalierung) vergleichen; Palette = Alpha-Bytes je Palette-Index (≤ PLTE-Größe).
 
+**8. Adam7-Interlace (RFC 2083, 2.6):** 7 Pässe über ein 8×8-Raster:
+
+| Pass | (Startz, Starts, Zeilenschritt, Spaltenschritt) |
+| --- | --- |
+| 1 | (0, 0, 8, 8) |
+| 2 | (0, 4, 8, 8) |
+| 3 | (4, 0, 8, 4) — Spaltenschritt **4**, nicht 8 |
+| 4 | (0, 2, 4, 4) |
+| 5 | (2, 0, 4, 2) |
+| 6 | (0, 1, 2, 2) |
+| 7 | (1, 0, 2, 1) — *alle* Spalten der ungeraden Zeilen |
+
+Jeder Pass ist ein eigenes Mini-Bild: eigene Pass-Breite/-Höhe (⌈-Formeln),
+eigene Filterbytes, **pass-lokaler Filterkontext** (Prev-Zeile = vorherige
+Zeile desselben Passes), und Pass-Zeilen werden separat auf Ganzes Byte
+gepolstert. Leere Pässe (unter 5 Spalten/Zeilen) tragen keine Filterbytes.
+Der Decoder prüft die Pass-Tabelle per Property-Test gegen das 8×8-Grid
+aus der Spec (jede Zelle genau einmal).
+
 ## Fehlerkanäle (alle mit deutlicher deutscher Meldung)
 
 - falsche Signatur, abgeschnittene Chunks, CRC-Mismatch (mit gespeichert/berechnet)
@@ -107,7 +126,8 @@ Lern-Fall: vorletztes Byte `a=0, b=10, c=0` — `p=10`, `pb=0` minimal → **b**
 
 ## Übungsaufgaben (nächste Ebene)
 
-- [ ] Adam7-Interlace implementieren (7 Durchgänge, Pass-Offsets nach Spec 8.1)
+- [x] Adam7-Interlace (IMPLEMENTED + TESTED: Property-Test gegen Spec-Grid,
+  Roundtrips für Farbarten/Bittiefen, pass-lokaler Filterkontext)
 - [ ] PNG-**Writer** mit Filter-Optimalwahl (beste Filtertypen pro Zeile messen)
 - [ ] Chunk-Writer (tEXt anpassen, ohne Bildbits zu berühren); BMP-Export
 - [ ] Fuzzing: Byte-Flip-Loop automatisieren (Kaputt-Muster aus `kaputt.png`)
@@ -116,9 +136,9 @@ Lern-Fall: vorletztes Byte `a=0, b=10, c=0` — `p=10`, `pb=0` minimal → **b**
 
 ## Status (FACT / IMPLEMENTED / TESTED)
 
-- IMPLEMENTED: Decoder (alle Farbarten/Bittiefen non-interlaced), CRC-Check,
-  tRNS/tEXt, PPM-Export, CLI, Review-Fixes (doppelte PLTE/tRNS abgelehnt,
-  Paletten-Index-Bounds, CLI fängt auch OSError).
-- TESTED: 46/46 unittests (`python -m unittest test_pngparser`), ruff clean,
+- IMPLEMENTED: Decoder (alle Farbarten/Bittiefen, non-interlaced UND Adam7),
+  CRC-Check, tRNS/tEXt, PPM-Export, CLI, Review-Fixes (doppelte PLTE/tRNS
+  abgelehnt, Paletten-Index-Bounds, CLI fängt auch OSError).
+- TESTED: 57/57 unittests (`python -m unittest test_pngparser`), ruff clean,
   basedpyright 0 Errors / 0 Warnungen, CLI-Feldtest mit generiertem sowie
   gezielt korruptiertem PNG (CRC-Fehler-Fall: Exit 1).

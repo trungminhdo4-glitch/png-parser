@@ -18,7 +18,6 @@ from typing import ClassVar
 import pngparser
 from pngparser import (
     PngFormatError,
-    PngUnsupportedError,
     decode_png,
     load,
 )
@@ -69,6 +68,75 @@ def encode_png(
     if filtered_rows is None:
         filtered_rows = [b"\x00" + row for row in (rows or [])]
     parts.append(make_chunk(b"IDAT", zlib.compress(b"".join(filtered_rows))))
+    parts.append(make_chunk(b"IEND", b""))
+    return b"".join(parts)
+
+
+def pack_samples(samples: list[int], depth: int) -> bytes:
+    """Test-eigene Sampleverpackung (MSB zuerst), Zeilenbytes rechts 0-gepolstert."""
+    if depth == 8:
+        return bytes(samples)
+    if depth == 16:
+        return b"".join(struct.pack(">H", s) for s in samples)
+    out = bytearray()
+    acc = 0
+    filled = 0
+    for s in samples:
+        acc = (acc << depth) | s
+        filled += depth
+        while filled >= 8:
+            filled -= 8
+            out.append((acc >> filled) & 0xFF)
+            acc &= (1 << filled) - 1
+    if filled:
+        out.append((acc << (8 - filled)) & 0xFF)
+    return bytes(out)
+
+
+def encode_png_interlaced(
+    width: int,
+    height: int,
+    depth: int,
+    ctype: int,
+    sample_rows: list[list[int]],
+    *,
+    palette: bytes | None = None,
+    trns: bytes | None = None,
+    interlace_filter: int = 0,
+) -> bytes:
+    """Adam7-interlaced PNG: sample_rows = Hoehe x (Breite*Kanaele) Samples."""
+    ch = pngparser.CHANNELS_PER_COLOR_TYPE[ctype]
+    raw = bytearray()
+    for y0, x0, ystep, xstep in pngparser.ADAM7_PASSES:
+        pw = (width - x0 + xstep - 1) // xstep
+        ph = (height - y0 + ystep - 1) // ystep
+        if pw <= 0 or ph <= 0:
+            continue
+        stride = (pw * depth * ch + 7) // 8
+        prev_raw = bytearray(stride)
+        for j in range(ph):
+            full_y = y0 + j * ystep
+            pass_samples = [
+                sample_rows[full_y][(x0 + i * xstep) * ch + c]
+                for i in range(pw)
+                for c in range(ch)
+            ]
+            raw_row = pack_samples(pass_samples, depth)
+            if interlace_filter and j > 0:
+                # Up: gefiltert = roh minus rohe Pass-Vorgaengerzeile
+                filtered = bytes((r - p) & 0xFF for r, p in zip(raw_row, prev_raw))
+            else:
+                filtered = raw_row
+            raw.append(0 if interlace_filter == 0 or j == 0 else interlace_filter)
+            raw.extend(filtered)
+            prev_raw = bytearray(raw_row)  # Prev-Kontext ist die ROHE Zeile
+    ihdr = struct.pack(">IIBBBBB", width, height, depth, ctype, 0, 0, 1)
+    parts = [SIGNATURE, make_chunk(b"IHDR", ihdr)]
+    if palette is not None:
+        parts.append(make_chunk(b"PLTE", palette))
+    if trns is not None:
+        parts.append(make_chunk(b"tRNS", trns))
+    parts.append(make_chunk(b"IDAT", zlib.compress(bytes(raw))))
     parts.append(make_chunk(b"IEND", b""))
     return b"".join(parts)
 
@@ -422,10 +490,181 @@ class ChunkOrderingTests(unittest.TestCase):
         )
         self.assertEqual(img.text, {"Title": "Demo", "Author": "Ich"})
 
-    def test_interlace_1_unsupported(self) -> None:
-        data = encode_png(1, 1, 8, 2, rows=[b"\xff\x00\x00"], interlace=1)
-        with self.assertRaisesRegex(PngUnsupportedError, "Adam7"):
-            decode_png(data)
+    def test_interlace_2_raises(self) -> None:
+        ihdr = struct.pack(">IIBBBBB", 1, 1, 8, 2, 0, 0, 2)
+        parts = [
+            SIGNATURE,
+            make_chunk(b"IHDR", ihdr),
+            make_chunk(b"IDAT", zlib.compress(b"\x00\x00\xff\x00")),
+            make_chunk(b"IEND", b""),
+        ]
+        with self.assertRaisesRegex(PngFormatError, "Interlace"):
+            decode_png(b"".join(parts))
+
+
+class InterlaceTests(unittest.TestCase):
+    """Adam7-Interlace: Pass-Tabelle, Pass-Entzerren, Pass-lokaler Filterkontext."""
+
+    def test_adam7_table_matches_spec_grid(self) -> None:
+        # RFC 2083, Abschnitt 2.6, Figur 8-1 (8x8-Raster der Pass-Nummern)
+        spec_grid = (
+            (1, 6, 4, 6, 2, 6, 4, 6),
+            (7, 7, 7, 7, 7, 7, 7, 7),
+            (5, 6, 5, 6, 5, 6, 5, 6),
+            (7, 7, 7, 7, 7, 7, 7, 7),
+            (3, 6, 4, 6, 3, 6, 4, 6),
+            (7, 7, 7, 7, 7, 7, 7, 7),
+            (5, 6, 5, 6, 5, 6, 5, 6),
+            (7, 7, 7, 7, 7, 7, 7, 7),
+        )
+        covered: dict[tuple[int, int], int] = {}
+        for pass_no, (y0, x0, ystep, xstep) in enumerate(
+            pngparser.ADAM7_PASSES, start=1
+        ):
+            for y in range(y0, 8, ystep):
+                for x in range(x0, 8, xstep):
+                    cell = (y, x)
+                    self.assertNotIn(
+                        cell, covered, f"Zelle {cell} doppelt (Pass {pass_no})"
+                    )
+                    covered[cell] = pass_no
+        self.assertEqual(len(covered), 64)
+        expected = {(y, x): spec_grid[y][x] for y in range(8) for x in range(8)}
+        self.assertEqual(covered, expected)
+
+    def test_interlaced_gray8_roundtrip(self) -> None:
+        # 9x9: alle 7 Paesse nichtleer, ungerade Kanten
+        sample_rows = [[(y * 29 + x * 7) % 256 for x in range(9)] for y in range(9)]
+        img = decode_png(encode_png_interlaced(9, 9, 8, 0, sample_rows))
+        self.assertEqual(
+            img.to_rgba_rows(),
+            [[(v, v, v, 255) for v in row] for row in sample_rows],
+        )
+
+    def test_interlaced_rgb8_roundtrip(self) -> None:
+        # flache Sampleliste: pro Pixel 3 Werte (r, g, b)
+        sample_rows = [
+            [v for x in range(9) for v in (x * 28, y * 28, 128)] for y in range(9)
+        ]
+        img = decode_png(encode_png_interlaced(9, 9, 8, 2, sample_rows))
+        self.assertEqual(
+            img.to_rgba_rows(),
+            [
+                [tuple(row[i : i + 3]) + (255,) for i in range(0, len(row), 3)]
+                for row in sample_rows
+            ],
+        )
+
+    def test_interlaced_rgba8_roundtrip(self) -> None:
+        sample_rows = [
+            [v for x in range(5) for v in (x * 40, y * 40, 10, x * y % 256)]
+            for y in range(5)
+        ]
+        img = decode_png(encode_png_interlaced(5, 5, 8, 6, sample_rows))
+        self.assertEqual(
+            img.to_rgba_rows(),
+            [
+                [tuple(row[i : i + 4]) for i in range(0, len(row), 4)]
+                for row in sample_rows
+            ],
+        )
+
+    def test_interlaced_gray16_roundtrip(self) -> None:
+        sample_rows = [
+            [(y * 1000 + x * 333) % 65536 for x in range(3)] for y in range(3)
+        ]
+        img = decode_png(encode_png_interlaced(3, 3, 16, 0, sample_rows))
+        self.assertEqual(
+            img.to_rgba_rows(),
+            [[((v >> 8), (v >> 8), (v >> 8), 255) for v in row] for row in sample_rows],
+        )
+
+    def test_interlaced_palette8_roundtrip(self) -> None:
+        palette = (
+            bytes((16, 32, 48))
+            + bytes((240, 224, 208))
+            + bytes((9, 9, 9))
+            + bytes((7, 7, 7))
+        )
+        trns = bytes((0, 128, 200, 255))
+        sample_rows = [[(x + y) % 4 for x in range(8)] for y in range(8)]
+        img = decode_png(
+            encode_png_interlaced(8, 8, 8, 3, sample_rows, palette=palette, trns=trns)
+        )
+        colors = [(16, 32, 48), (240, 224, 208), (9, 9, 9), (7, 7, 7)]
+        expected = [
+            [(colors[i][0], colors[i][1], colors[i][2], trns[i]) for i in row]
+            for row in sample_rows
+        ]
+        self.assertEqual(img.to_rgba_rows(), expected)
+
+    def test_interlaced_gray1bit_pass_row_padding(self) -> None:
+        # 9 Pixel à 1 Bit: jede Pass-Zeile wird separat auf Ganzes Byte gepolstert
+        sample_rows = [[(x + y) % 2 for x in range(9)] for y in range(9)]
+        img = decode_png(encode_png_interlaced(9, 9, 1, 0, sample_rows))
+        self.assertEqual(
+            img.to_rgba_rows(),
+            [
+                [((v * 255), (v * 255), (v * 255), 255) for v in row]
+                for row in sample_rows
+            ],
+        )
+
+    def test_interlaced_pass_local_filter_context(self) -> None:
+        # Filter 2 (Up) innerhalb der Paesse: Prev = Pass-Vorgaengerzeile,
+        # nicht die volle Bildzeile darueber.
+        sample_rows = [
+            [v for x in range(9) for v in (x * 31, y * 17, 200)] for y in range(9)
+        ]
+        data = encode_png_interlaced(9, 9, 8, 2, sample_rows, interlace_filter=2)
+        img = decode_png(data)
+        self.assertEqual(
+            img.to_rgba_rows(),
+            [
+                [tuple(row[i : i + 3]) + (255,) for i in range(0, len(row), 3)]
+                for row in sample_rows
+            ],
+        )
+
+    def test_interlaced_1x1_only_pass1(self) -> None:
+        # 1x1: nur Pass 1 liefert eine Scanline, Pass 2-7 leer (keine Filterbytes)
+        sample_rows = [[7, 200, 90]]
+        img = decode_png(encode_png_interlaced(1, 1, 8, 2, sample_rows))
+        self.assertEqual(img.to_rgba_rows(), [[(7, 200, 90, 255)]])
+
+    def test_interlaced_idat_extra_bytes_raises(self) -> None:
+        sample_rows = [
+            [v for x in range(3) for v in (x * 3, y * 5, 90)] for y in range(3)
+        ]
+        base = encode_png_interlaced(3, 3, 8, 2, sample_rows)
+        idat = next(c for c in pngparser.read_chunks(base) if c.type_name == "IDAT")
+        raw = zlib.decompress(idat.data) + b"\x00"
+        ihdr = struct.pack(">IIBBBBB", 3, 3, 8, 2, 0, 0, 1)
+        parts = [
+            SIGNATURE,
+            make_chunk(b"IHDR", ihdr),
+            make_chunk(b"IDAT", zlib.compress(raw)),
+            make_chunk(b"IEND", b""),
+        ]
+        with self.assertRaisesRegex(PngFormatError, "Rohdaten"):
+            decode_png(b"".join(parts))
+
+    def test_interlaced_idat_truncated_pass_raises(self) -> None:
+        sample_rows = [
+            [v for x in range(3) for v in (x * 3, y * 5, 90)] for y in range(3)
+        ]
+        base = encode_png_interlaced(3, 3, 8, 2, sample_rows)
+        idat = next(c for c in pngparser.read_chunks(base) if c.type_name == "IDAT")
+        raw = zlib.decompress(idat.data)[:-2]
+        ihdr = struct.pack(">IIBBBBB", 3, 3, 8, 2, 0, 0, 1)
+        parts = [
+            SIGNATURE,
+            make_chunk(b"IHDR", ihdr),
+            make_chunk(b"IDAT", zlib.compress(raw)),
+            make_chunk(b"IEND", b""),
+        ]
+        with self.assertRaisesRegex(PngFormatError, "abgeschnitten"):
+            decode_png(b"".join(parts))
 
 
 class IoAndExportTests(unittest.TestCase):

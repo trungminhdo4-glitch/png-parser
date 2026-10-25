@@ -4,7 +4,7 @@ Alles nach PNG-Spec 1.2, nur Python-Stdlib, komplett offline. Gebaut als
 Reverse-Engineering-Uebung: das Dateiformat Byte fuer Byte erklaeren.
 
 Nur Decoder (lesen). Unterstuetzt:
-- Non-interlaced (Adam7-Interlace -> PngUnsupportedError)
+- Non-interlaced UND Adam7-Interlace (7 Pässe, pass-lokaler Filterkontext)
 - Alle 5 Farbarten: 0=Graustufen, 2=RGB, 3=Palette, 4=Graustufen+Alpha, 6=RGBA
 - Alle Bittiefen: 1, 2, 4, 8, 16
 - Alle 5 Filter: None, Sub, Up, Average, Paeth
@@ -51,6 +51,19 @@ COLOR_TYPE_NAMES = {
     4: "Graustufen+Alpha",
     6: "RGBA",
 }
+
+#: Adam7-Paesse (RFC 2083, 2.6 / PNG-Spec 8.1): (Startzeile, Startspalte,
+#: Zeilenschritt, Spaltenschritt). Aus dem 8x8-Grid des Specs abgeleitet und
+#: per Property-Test gegen genau dieses Grid geprueft.
+ADAM7_PASSES = (
+    (0, 0, 8, 8),  # Pass 1: alle 8. Zeile/Spalte
+    (0, 4, 8, 8),  # Pass 2
+    (4, 0, 8, 4),  # Pass 3: Spaltenschritt 4, nicht 8
+    (0, 2, 4, 4),  # Pass 4
+    (2, 0, 4, 2),  # Pass 5
+    (0, 1, 2, 2),  # Pass 6
+    (1, 0, 2, 1),  # Pass 7: alle Spalten der ungeraden Zeilen
+)
 
 
 class PngError(Exception):
@@ -153,7 +166,8 @@ class PngImage:
     palette: tuple[tuple[int, int, int], ...] | None
     trns: bytes | None
     text: dict[str, str]
-    _rows: list[bytes]  # unfilterte Scanlines, Zeilen ohne Filterbyte
+    _rows: list[bytes]  # unfilterte Scanlines, Zeilen ohne Filterbyte (interlace 0)
+    _samples: list[list[int]] | None = None  # Sample-Matrix (interlace 1)
 
     @property
     def width(self) -> int:
@@ -189,15 +203,24 @@ class PngImage:
         return (self.width * self.bit_depth * self.channels + 7) // 8
 
     def raw_rows(self) -> list[bytes]:
-        """Unfilterte Scanlines (ohne Filterbyte)."""
+        """Unfilterte Scanlines (ohne Filterbyte); bei Adam7-Interlace leer."""
         return list(self._rows)
+
+    def _iter_sample_rows(self) -> Iterator[list[int]]:
+        """Je Bildzeile die Roh-Samples (Basis der Farbkonvertierung)."""
+        if self._samples is not None:
+            yield from self._samples
+            return
+        for row in self._rows:
+            yield _expand_samples(row, self.width * self.channels, self.bit_depth)
 
     def iter_rgba(self) -> Iterator[tuple[int, int, int, int]]:
         """Alle Pixel in Rasterreihenfolge als (r, g, b, a) mit 8 Bit je Kanal.
 
         16-Bit-Bilder werden auf 8 Bit gekuerzt (>> 8), sub-byte-Bittiefen
         proportional skaliert (Wert * 255 // max). Palette wird ueber PLTE
-        und tRNS aufgeloest, Graustufen/RGB-Einfarbtransparenz über tRNS.
+        und tRNS aufgeloest, Graustufen/RGB-Einfarbtransparenz ueber tRNS.
+        Funktioniert identisch fuer non-interlaced und Adam7-PNGs.
         """
         depth = self.bit_depth
         ch = self.channels
@@ -209,10 +232,9 @@ class PngImage:
             return v * 255 // max_v
 
         trns = self.trns
-        for row in self._rows:
-            samples = _expand_samples(row, self.width * ch, depth)
+        for row_samples in self._iter_sample_rows():
             for px in range(self.width):
-                s = samples[px * ch : (px + 1) * ch]
+                s = row_samples[px * ch : (px + 1) * ch]
                 ct = self.color_type
                 if ct == 0:
                     g = scale(s[0])
@@ -332,11 +354,6 @@ def _parse_ihdr(chunk: Chunk) -> Ihdr:
         )
     if interlace not in (0, 1):
         raise PngFormatError(f"Interlace-Methode {interlace} unbekannt (0 oder 1)")
-    if interlace == 1:
-        raise PngUnsupportedError(
-            "Adam7-Interlace wird von diesem Lern-Parser nicht unterstützt "
-            "(nur non-interlaced PNGs)"
-        )
     return Ihdr(width, height, depth, ct, compression, filter_method, interlace)
 
 
@@ -470,6 +487,44 @@ def _unfilter_rows(raw: bytes, stride: int, byte_pp: int, height: int) -> list[b
     return rows
 
 
+def _decode_adam7(raw: bytes, ihdr: Ihdr) -> list[list[int]]:
+    """Adam7-Paesse entzerren -> Sample-Matrix (Hoehe x Breite*Kanaele).
+
+    Jeder Pass ist ein eigenes Mini-Bild: eigener Zeilenschritt, eigene
+    Filterbytes und ein Pass-lokaler Filterkontext (Prev-Zeile = vorherige
+    Zeile desselben Passes). Leere Paesse tragen keine Filterbytes.
+    """
+    ch = CHANNELS_PER_COLOR_TYPE[ihdr.color_type]
+    width, height, depth = ihdr.width, ihdr.height, ihdr.bit_depth
+    matrix: list[list[int]] = [[0] * (width * ch) for _ in range(height)]
+    pos = 0
+    for pass_no, (y0, x0, ystep, xstep) in enumerate(ADAM7_PASSES, start=1):
+        pw = (width - x0 + xstep - 1) // xstep
+        ph = (height - y0 + ystep - 1) // ystep
+        if pw <= 0 or ph <= 0:
+            continue
+        stride = (pw * depth * ch + 7) // 8
+        needed = ph * (stride + 1)
+        if pos + needed > len(raw):
+            raise PngFormatError(
+                f"IDAT-Rohdaten abgeschnitten: Pass {pass_no} braucht {needed} "
+                f"Bytes, nur {len(raw) - pos} übrig"
+            )
+        pass_rows = _unfilter_rows(raw[pos : pos + needed], stride, bpp(depth, ch), ph)
+        pos += needed
+        for j, pass_row in enumerate(pass_rows):
+            samples = _expand_samples(pass_row, pw * ch, depth)
+            y = y0 + j * ystep
+            for i in range(pw):
+                x = x0 + i * xstep
+                matrix[y][x * ch : (x + 1) * ch] = samples[i * ch : (i + 1) * ch]
+    if pos != len(raw):
+        raise PngFormatError(
+            f"IDAT-Rohdaten: {len(raw) - pos} überschüssige Bytes nach Pass 7"
+        )
+    return matrix
+
+
 def _expand_samples(row: bytes, count: int, depth: int) -> list[int]:
     """Bytes -> Naive Sampleliste (value pro Sample, sub-byte: MSB zuerst)."""
     if depth == 8:
@@ -514,6 +569,19 @@ def decode_png(data: bytes, *, verify_crc: bool = True) -> PngImage:
         raise PngFormatError(f"IDAT: deflate-Daten sind korrupt ({exc})") from exc
 
     ch = CHANNELS_PER_COLOR_TYPE[ihdr.color_type]
+    if ihdr.interlace == 1:
+        matrix = _decode_adam7(raw, ihdr)
+        if ihdr.color_type == 3:
+            _validate_palette_indices(palette, matrix)
+        return PngImage(
+            ihdr=ihdr,
+            chunks=chunks,
+            palette=palette,
+            trns=trns,
+            text=text,
+            _rows=[],
+            _samples=matrix,
+        )
     stride = (ihdr.width * ihdr.bit_depth * ch + 7) // 8
     byte_pp = bpp(ihdr.bit_depth, ch)
     expected = ihdr.height * (stride + 1)
@@ -526,15 +594,9 @@ def decode_png(data: bytes, *, verify_crc: bool = True) -> PngImage:
     if ihdr.color_type == 3:
         # Pixel-Indizes gegen die reale Palettenlaenge pruefen, sonst wuerde
         # erst iter_rgba() mit rohem IndexError abstuerzen.
-        assert palette is not None
-        entries = len(palette)
-        for y, row in enumerate(rows):
-            for x, index in enumerate(_expand_samples(row, ihdr.width, ihdr.bit_depth)):
-                if index >= entries:
-                    raise PngFormatError(
-                        f"Pixel-Index {index} in Zeile {y}, Spalte {x} zeigt hinter die "
-                        f"Palette ({entries} Einträge)"
-                    )
+        _validate_palette_indices(
+            palette, [_expand_samples(row, ihdr.width, ihdr.bit_depth) for row in rows]
+        )
     return PngImage(
         ihdr=ihdr,
         chunks=chunks,
@@ -543,6 +605,22 @@ def decode_png(data: bytes, *, verify_crc: bool = True) -> PngImage:
         text=text,
         _rows=rows,
     )
+
+
+def _validate_palette_indices(
+    palette: tuple[tuple[int, int, int], ...] | None, sample_rows: list[list[int]]
+) -> None:
+    """Alle Pixel-Indizes gegen die reale Palettenlaenge pruefen, sonst wuerde
+    erst iter_rgba() mit rohem IndexError abstuerzen."""
+    assert palette is not None
+    entries = len(palette)
+    for y, row_samples in enumerate(sample_rows):
+        for x, index in enumerate(row_samples):
+            if index >= entries:
+                raise PngFormatError(
+                    f"Pixel-Index {index} in Zeile {y}, Spalte {x} zeigt hinter die "
+                    f"Palette ({entries} Einträge)"
+                )
 
 
 def load(path: str, *, verify_crc: bool = True) -> PngImage:
@@ -599,11 +677,11 @@ def main(argv: list[str] | None = None) -> int:
     print(
         f"  Farbart: {img.color_type} = {img.color_type_name} ({img.channels} Kanäle)"
     )
-    print(
-        f"  Bittiefe: {img.bit_depth} Bit, Zeilenstruktur: {img.stride + 1} Bytes (1 Filterbyte + {img.stride})"
-    )
+    print(f"  Bittiefe: {img.bit_depth} Bit")
     if img.interlace:
-        print("  Interlace: Adam7")
+        print("  Interlace: Adam7 (7 Pässe)")
+    else:
+        print(f"  Zeilenstruktur: {img.stride + 1} Bytes (1 Filterbyte + {img.stride})")
     if img.palette is not None:
         print(f"  Palette: {len(img.palette)} Einträge")
     if img.trns:
