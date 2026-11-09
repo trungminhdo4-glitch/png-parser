@@ -304,7 +304,7 @@ def read_chunks(data: bytes, *, verify_crc: bool = True) -> list[Chunk]:
             )
         chunk_data = data[pos + 8 : pos + 8 + length]
         crc_stored = int.from_bytes(data[chunk_end - 4 : chunk_end], "big")
-        crc_computed = zlib.crc32(ctype + chunk_data) & 0xFFFFFFFF
+        crc_computed = zlib.crc32(chunk_data, zlib.crc32(ctype)) & 0xFFFFFFFF
         if verify_crc and crc_stored != crc_computed:
             raise PngFormatError(
                 f"CRC32 passt nicht bei Chunk {ctype.decode('ascii', 'replace')} "
