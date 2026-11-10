@@ -7,7 +7,7 @@ offline — gebaut als Reverse-Engineering-Übung für das eigene Formatverstän
 | Datei | Inhalt |
 | --- | --- |
 | `pngparser.py` | Parser + PPM-Export + CLI (`python pngparser.py bild.png`) |
-| `test_pngparser.py` | 57 unittests mit eigenem Mini-Encoder als Fixture-Generator |
+| `test_pngparser.py` | Unittests mit eigenem Mini-Encoder als Fixture-Generator |
 | `pyrightconfig.json` | basedpyright-Konfig (zwei Strikt-Regeln gedämpft) |
 | `LICENSE` | MIT |
 

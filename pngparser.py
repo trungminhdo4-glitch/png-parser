@@ -708,7 +708,11 @@ def main(argv: list[str] | None = None) -> int:
                 break
             print(f"  Pixel {index}: {pixel}")
     if ppm:
-        write_ppm(img, ppm)
+        try:
+            write_ppm(img, ppm)
+        except OSError as exc:
+            print(f"FEHLER: PPM-Export nach {ppm}: {exc}", file=sys.stderr)
+            return 1
         print(f"  Exportiert nach {ppm}")
     return 0
 

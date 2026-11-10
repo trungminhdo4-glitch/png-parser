@@ -712,6 +712,18 @@ class IoAndExportTests(unittest.TestCase):
         self.assertIn("FEHLER", err.getvalue())
         self.assertNotIn("FEHLER", out.getvalue())
 
+    def test_main_reports_failed_ppm_export(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            source = os.path.join(tmp, "source.png")
+            with open(source, "wb") as fh:
+                fh.write(encode_png(1, 1, 8, 2, rows=[bytes((1, 2, 3))]))
+            out, err = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                code = pngparser.main([source, "--ppm", tmp])
+        self.assertEqual(code, 1)
+        self.assertIn("FEHLER: PPM-Export", err.getvalue())
+        self.assertNotIn("Exportiert nach", out.getvalue())
+
     def test_idat_junk_after_zlib_stream_raises(self) -> None:
         # zlib.decompress() verwirft trailing Bytes kommentarlos; ein strenger
         # Parser meldet sie (Spec: zlib-Stream endet am IDAT-Ende).
