@@ -128,6 +128,7 @@ aus der Spec (jede Zelle genau einmal).
 - unlautere Farbart/Bittiefe-Kombi, fehlerhafte PLTE (kein Vielfaches von 3,
   zu viele Einträge, verboten bei Graustufen)
 - doppelte PLTE/tRNS (Spec: darf nur einmal vorkommen)
+- tRNS nach IDAT, PLTE nach tRNS, IEND mit Nutzdaten und unbekannte kritische Chunks
 - Paletten-Index hinter der PLTE-Länge (bricht mit Meldung, nicht mit IndexError)
 - überschüssige Bytes nach dem zlib-Stream im IDAT (stdlib verwirft sie still)
 

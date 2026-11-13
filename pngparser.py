@@ -327,6 +327,8 @@ def read_chunks(data: bytes, *, verify_crc: bool = True) -> list[Chunk]:
         )
         pos = chunk_end
         if ctype == b"IEND":
+            if length:
+                raise PngFormatError("IEND darf keine Daten enthalten")
             break
     if pos != len(data):
         raise PngFormatError(
@@ -378,7 +380,7 @@ def _split_middle_chunks(
     idat_started = False
     for chunk in chunks[1:-1]:
         name = chunk.type_name
-        if name == "IHDR":  # kann hier nicht vorkommen (read_chunks bricht bei IEND)
+        if name == "IHDR":
             raise PngFormatError("IHDR darf nur einmal direkt am Anfang stehen")
         if name == "PLTE":
             if palette_raw is not None:
@@ -387,27 +389,26 @@ def _split_middle_chunks(
                 )
             if idat_started:
                 raise PngFormatError("PLTE muss vor dem ersten IDAT kommen")
+            if trns is not None:
+                raise PngFormatError("PLTE muss vor tRNS kommen")
             if ihdr.color_type in (0, 4):
                 raise PngFormatError(
                     f"PLTE ist bei Farbart {COLOR_TYPE_NAMES[ihdr.color_type]} verboten"
-                )
-            if ihdr.color_type in (2, 6):
-                raise PngFormatError(
-                    f"PLTE ist bei Farbart {COLOR_TYPE_NAMES[ihdr.color_type]} nicht erlaubt "
-                    "(Truecolor braucht keine Palette)"
                 )
             if len(chunk.data) == 0 or len(chunk.data) % 3 != 0:
                 raise PngFormatError(
                     f"PLTE-Länge {len(chunk.data)} ist nicht (positives) Vielfaches von 3"
                 )
             entries = len(chunk.data) // 3
-            if entries > 2**ihdr.bit_depth:
+            max_entries = 2**ihdr.bit_depth if ihdr.color_type == 3 else 256
+            if entries > max_entries:
                 raise PngFormatError(
-                    f"PLTE hat {entries} Einträge, mehr als {2**ihdr.bit_depth} "
-                    f"(Bittiefe {ihdr.bit_depth}) erlaubt"
+                    f"PLTE hat {entries} Einträge, höchstens {max_entries} erlaubt"
                 )
             palette_raw = chunk.data
         elif name == "tRNS":
+            if idat_started:
+                raise PngFormatError("tRNS muss vor dem ersten IDAT kommen")
             if trns is not None:
                 raise PngFormatError(
                     "tRNS darf nur einmal vorkommen (zweiter Chunk gefunden)"
@@ -426,7 +427,9 @@ def _split_middle_chunks(
                     f"tRNS für RGB braucht 6 Bytes, hat {len(chunk.data)}"
                 )
             if ihdr.color_type == 3:
-                entries = len(palette_raw) // 3 if palette_raw else 0
+                if palette_raw is None:
+                    raise PngFormatError("tRNS für indizierte Farben muss nach PLTE kommen")
+                entries = len(palette_raw) // 3
                 if len(chunk.data) > entries:
                     raise PngFormatError(
                         f"tRNS ({len(chunk.data)} Einträge) länger als PLTE ({entries} Einträge)"
@@ -444,8 +447,8 @@ def _split_middle_chunks(
                     )
                 idat_started = True
             idats.append(chunk.data)
-        elif name in ("IEND",):
-            raise PngFormatError("IEND darf nur als letzter Chunk vorkommen")
+        elif chunk.is_critical:
+            raise PngUnsupportedError(f"Unbekannter kritischer Chunk: {name}")
         prev_name = name
     palette = None
     if palette_raw is not None:

@@ -378,6 +378,28 @@ class FilterTests(unittest.TestCase):
 class ChunkOrderingTests(unittest.TestCase):
     """IDAT-Konkatenation, PLTE-Anforderungen, Unbekannte tolerieren."""
 
+    def test_truecolor_allows_suggested_palette(self) -> None:
+        for color_type, pixel in ((2, b"\x01\x02\x03"), (6, b"\x01\x02\x03\x40")):
+            with self.subTest(color_type=color_type):
+                img = decode_png(encode_png(1, 1, 8, color_type, rows=[pixel], palette=b"\xff\x00\x00"))
+                self.assertEqual(img.palette, ((255, 0, 0),))
+                self.assertEqual(next(img.iter_rgba()), (1, 2, 3, 64 if color_type == 6 else 255))
+
+    def test_invalid_critical_chunks_and_transparency_order(self) -> None:
+        ihdr = make_chunk(b"IHDR", struct.pack(">IIBBBBB", 1, 1, 8, 2, 0, 0, 0))
+        idat = make_chunk(b"IDAT", zlib.compress(b"\x00\x01\x02\x03"))
+        end = make_chunk(b"IEND", b"")
+        trns = make_chunk(b"tRNS", b"\x00\x01\x00\x02\x00\x03")
+        palette = make_chunk(b"PLTE", b"\x01\x02\x03")
+        for chunks, error in (
+            (make_chunk(b"ABCD", b"") + idat + end, "ABCD"),
+            (idat + make_chunk(b"IEND", b"x"), "IEND"),
+            (idat + trns + end, "tRNS"),
+            (trns + palette + idat + end, "PLTE"),
+        ):
+            with self.subTest(error=error), self.assertRaisesRegex(pngparser.PngError, error):
+                decode_png(SIGNATURE + ihdr + chunks)
+
     def test_split_idat_ok(self) -> None:
         ihdr = struct.pack(">IIBBBBB", 1, 1, 8, 2, 0, 0, 0)
         idat = zlib.compress(b"\x00" + b"\xff\x00\x00")
