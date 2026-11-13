@@ -735,6 +735,37 @@ class IoAndExportTests(unittest.TestCase):
                 blob = fh.read()
         self.assertTrue(blob.endswith(bytes((1, 2, 3))))
 
+    def test_pam_cli_preserves_palette_transparency_and_pixel_order(self) -> None:
+        data = encode_png(
+            2, 2, 8, 3, rows=[b"\x00\x01", b"\x01\x00"],
+            palette=bytes((1, 2, 3, 4, 5, 6)), trns=b"\x40",
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            source = os.path.join(tmp, "source.png")
+            target = os.path.join(tmp, "output.pam")
+            with open(source, "wb") as fh:
+                fh.write(data)
+            with contextlib.redirect_stdout(io.StringIO()):
+                code = pngparser.main([source, "--pam", target])
+            self.assertEqual(code, 0)
+            with open(target, "rb") as fh:
+                header, raster = fh.read().split(b"ENDHDR\n", 1)
+        self.assertEqual(
+            header, b"P7\nWIDTH 2\nHEIGHT 2\nDEPTH 4\nMAXVAL 255\nTUPLTYPE RGB_ALPHA\n"
+        )
+        first = bytes((1, 2, 3, 64))
+        second = bytes((4, 5, 6, 255))
+        self.assertEqual(raster, first + second + second + first)
+
+    def test_ppm_export_crosses_block_boundary(self) -> None:
+        row = bytes((1, 2, 3)) * 8192 + bytes((4, 5, 6))
+        img = decode_png(encode_png(8193, 1, 8, 2, rows=[row]))
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "out.ppm")
+            img.save_ppm(path)
+            with open(path, "rb") as fh:
+                self.assertEqual(fh.read(), b"P6\n8193 1\n255\n" + row)
+
     def test_main_missing_file_reports_clean_error(self) -> None:
         # Nur PngError zu fangen wäre zu wenig: auch OSError (z. B. fehlende Datei)
         # muss zu einer klaren Meldung statt Traceback führen — auf STDERR

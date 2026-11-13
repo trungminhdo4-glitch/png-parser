@@ -30,6 +30,7 @@ tRNS, tEXt, CRC32-Prüfung.
 ```
 python pngparser.py bild.png                 # Info + Chunktabelle + CRC-Status
 python pngparser.py bild.png --ppm out.ppm   # in PPM (P6) exportieren
+python pngparser.py bild.png --pam out.pam   # in PAM (P7) mit Alphakanal exportieren
 python pngparser.py bild.png --pixels 8      # erste 8 Pixel zeigen
 python pngparser.py bild.png --max-pixels 25000000  # größere Bilder zulassen
 python pngparser.py bild.png --no-crc        # CRC aus (Fehlersuche)
@@ -39,6 +40,11 @@ Standardmäßig akzeptiert der Decoder bis zu 16.000.000 Pixel. Das Limit lässt
 sich in der CLI mit `--max-pixels` und in `load()` oder `decode_png()` mit
 `max_pixels=` ändern. Es gilt für die Pixelzahl. Der gesamte Speicherbedarf
 hängt auch von Farbart, Bittiefe und Interlace ab.
+
+PAM schreibt vier 8-Bit-Kanäle pro Pixel und übernimmt die Transparenz
+aus dem Alphakanal oder aus `tRNS`. Der Export ist auch über
+`img.save_pam("out.pam")` verfügbar. Beide Exportformate schreiben das
+Raster in Blöcken.
 
 ## Das Know-how — PNG-Dateistruktur Byte je Byte
 

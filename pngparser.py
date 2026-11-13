@@ -18,7 +18,7 @@ Beispiel:
     img.save_ppm("bild.ppm")   # ohne Lib anschau- und editierbar machen
 
 CLI:
-    python pngparser.py bild.png [--ppm out.ppm] [--pixels N] [--max-pixels N] [--no-crc]
+    python pngparser.py bild.png [--ppm out.ppm | --pam out.pam] [--pixels N] [--max-pixels N] [--no-crc]
 """
 
 from __future__ import annotations
@@ -29,7 +29,8 @@ import sys
 import zlib
 from collections.abc import Iterator
 from dataclasses import dataclass
-from typing import cast
+from itertools import islice
+from typing import BinaryIO, cast
 
 SIGNATURE = b"\x89PNG\r\n\x1a\n"
 DEFAULT_MAX_PIXELS = 16_000_000
@@ -267,6 +268,10 @@ class PngImage:
     def save_ppm(self, path: str) -> None:
         """Als PPM (P6, RGB) schreiben — Alpha wird verworfen (PPM kennt kein Alpha)."""
         write_ppm(self, path)
+
+    def save_pam(self, path: str) -> None:
+        """Als PAM (P7) mit 8-Bit-RGBA schreiben."""
+        write_pam(self, path)
 
 
 # --------------------------------------------------------------------------
@@ -659,11 +664,26 @@ def load(
     return decode_png(data, verify_crc=verify_crc, max_pixels=max_pixels)
 
 
+def _write_pixel_blocks(stream: BinaryIO, pixels: Iterator[bytes]) -> None:
+    while block := b"".join(islice(pixels, 8192)):
+        _ = stream.write(block)
+
+
 def write_ppm(img: PngImage, path: str) -> None:
     """Als PPM (P6, RGB) exportieren — Alpha geht verloren, PPM kennt kein Alpha."""
     with open(path, "wb") as fh:
         fh.write(b"P6\n%d %d\n255\n" % (img.width, img.height))
-        fh.write(b"".join(bytes((r, g, b)) for r, g, b, _ in img.iter_rgba()))
+        _write_pixel_blocks(fh, (bytes((r, g, b)) for r, g, b, _ in img.iter_rgba()))
+
+
+def write_pam(img: PngImage, path: str) -> None:
+    """Als PAM (P7) mit 8-Bit-RGBA exportieren."""
+    with open(path, "wb") as fh:
+        fh.write(
+            b"P7\nWIDTH %d\nHEIGHT %d\nDEPTH 4\nMAXVAL 255\n"
+            b"TUPLTYPE RGB_ALPHA\nENDHDR\n" % (img.width, img.height)
+        )
+        _write_pixel_blocks(fh, (bytes(pixel) for pixel in img.iter_rgba()))
 
 
 # --------------------------------------------------------------------------
@@ -676,7 +696,9 @@ def main(argv: list[str] | None = None) -> int:
         description="PNG-Datei ohne Bildbibliothek lesen (Lern-Parser, nur stdlib)."
     )
     parser.add_argument("path", help="PNG-Datei")
-    parser.add_argument("--ppm", metavar="ZIEL", help="Nach PPM (P6) exportieren")
+    export = parser.add_mutually_exclusive_group()
+    export.add_argument("--ppm", metavar="ZIEL", help="Nach PPM (P6) exportieren")
+    export.add_argument("--pam", metavar="ZIEL", help="Nach PAM (P7, RGBA) exportieren")
     parser.add_argument(
         "--pixels",
         metavar="N",
@@ -702,6 +724,7 @@ def main(argv: list[str] | None = None) -> int:
     no_crc = cast(bool, args.no_crc)
     pixels = cast("int | None", args.pixels)
     ppm = cast("str | None", args.ppm)
+    pam = cast("str | None", args.pam)
     max_pixels = cast(int, args.max_pixels)
     if max_pixels < 1:
         parser.error("--max-pixels muss mindestens 1 sein")
@@ -740,13 +763,15 @@ def main(argv: list[str] | None = None) -> int:
             if index >= pixels:
                 break
             print(f"  Pixel {index}: {pixel}")
-    if ppm:
+    destination = pam if pam is not None else ppm
+    if destination is not None:
+        writer, format_name = (write_pam, "PAM") if pam is not None else (write_ppm, "PPM")
         try:
-            write_ppm(img, ppm)
+            writer(img, destination)
         except OSError as exc:
-            print(f"FEHLER: PPM-Export nach {ppm}: {exc}", file=sys.stderr)
+            print(f"FEHLER: {format_name}-Export nach {destination}: {exc}", file=sys.stderr)
             return 1
-        print(f"  Exportiert nach {ppm}")
+        print(f"  Exportiert nach {destination}")
     return 0
 
 
