@@ -392,6 +392,26 @@ class ChunkOrderingTests(unittest.TestCase):
         img = decode_png(b"".join(parts))
         self.assertEqual(img.color_type, 2)
 
+    def test_checksum_split_across_idats(self) -> None:
+        ihdr = struct.pack(">IIBBBBB", 1, 1, 8, 2, 0, 0, 0)
+        stream = zlib.compress(b"\x00\xff\x00\x00")
+        header = SIGNATURE + make_chunk(b"IHDR", ihdr)
+        end = make_chunk(b"IEND", b"")
+        prefix = header + make_chunk(b"IDAT", stream[:-1])
+        complete = prefix + make_chunk(b"IDAT", stream[-1:])
+        img = decode_png(complete + make_chunk(b"IDAT", b"") + end)
+        self.assertEqual(list(img.iter_rgba()), [(255, 0, 0, 255)])
+        with self.assertRaisesRegex(PngFormatError, "zlib-Stream.*abgeschnitten"):
+            decode_png(prefix + end)
+        with self.assertRaisesRegex(PngFormatError, "überschüssige Bytes"):
+            decode_png(complete + make_chunk(b"IDAT", b"junk") + end)
+
+    def test_idat_exceeds_expected_size(self) -> None:
+        # Eine kleine Datei mit wesentlich mehr Rohdaten als im IHDR angegeben.
+        data = encode_png(1, 1, 8, 2, filtered_rows=[b"\x00" * (1024 * 1024)])
+        with self.assertRaisesRegex(PngFormatError, "Rohdaten.*mehr als 4 Bytes"):
+            decode_png(data)
+
     def test_split_idat_gap_raises(self) -> None:
         ihdr = struct.pack(">IIBBBBB", 1, 1, 8, 2, 0, 0, 0)
         idat = zlib.compress(b"\x00" + b"\xff\x00\x00")
@@ -678,6 +698,22 @@ class IoAndExportTests(unittest.TestCase):
                 fh.write(data)
             img = load(path)
             self.assertEqual(img.width, 1)
+
+    def test_pixel_limit_for_adam7_via_api_and_cli(self) -> None:
+        data = encode_png_interlaced(3, 2, 1, 0, [[0, 1, 0], [1, 0, 1]])
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "limited.png")
+            with open(path, "wb") as fh:
+                fh.write(data)
+            self.assertEqual(load(path, max_pixels=6).height, 2)
+            with self.assertRaisesRegex(pngparser.PngUnsupportedError, "6 Pixel.*5"):
+                load(path, max_pixels=5)
+            out, err = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                code = pngparser.main([path, "--max-pixels", "5"])
+        self.assertEqual(code, 1)
+        self.assertEqual(out.getvalue(), "")
+        self.assertIn("6 Pixel", err.getvalue())
 
     def test_save_ppm(self) -> None:
         img = decode_png(encode_png(2, 1, 8, 2, rows=[bytes((255, 0, 0, 0, 255, 0))]))

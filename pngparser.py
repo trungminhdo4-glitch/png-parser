@@ -18,7 +18,7 @@ Beispiel:
     img.save_ppm("bild.ppm")   # ohne Lib anschau- und editierbar machen
 
 CLI:
-    python pngparser.py bild.png [--ppm out.ppm] [--pixels] [--no-crc]
+    python pngparser.py bild.png [--ppm out.ppm] [--pixels N] [--max-pixels N] [--no-crc]
 """
 
 from __future__ import annotations
@@ -32,6 +32,7 @@ from dataclasses import dataclass
 from typing import cast
 
 SIGNATURE = b"\x89PNG\r\n\x1a\n"
+DEFAULT_MAX_PIXELS = 16_000_000
 
 #: Farbart -> Anzahl Samples pro Pixel (PNG-Spec, Tabelle 11.1)
 CHANNELS_PER_COLOR_TYPE = {0: 1, 2: 3, 3: 1, 4: 2, 6: 4}
@@ -455,7 +456,7 @@ def _split_middle_chunks(
 # --------------------------------------------------------------------------
 
 
-def _unfilter_rows(raw: bytes, stride: int, byte_pp: int, height: int) -> list[bytes]:
+def _unfilter_rows(raw: memoryview, stride: int, byte_pp: int, height: int) -> list[bytes]:
     """Alle Scanlines rekonstruieren (Filter umdrehen)."""
     rows: list[bytes] = []
     prev = bytearray(stride)
@@ -488,7 +489,18 @@ def _unfilter_rows(raw: bytes, stride: int, byte_pp: int, height: int) -> list[b
     return rows
 
 
-def _decode_adam7(raw: bytes, ihdr: Ihdr) -> list[list[int]]:
+def _adam7_layout(ihdr: Ihdr) -> Iterator[tuple[range, range, int]]:
+    bits_per_pixel = ihdr.bit_depth * CHANNELS_PER_COLOR_TYPE[ihdr.color_type]
+    for y0, x0, ystep, xstep in ADAM7_PASSES:
+        ys = range(y0, ihdr.height, ystep)
+        xs = range(x0, ihdr.width, xstep)
+        if xs and ys:
+            yield ys, xs, (len(xs) * bits_per_pixel + 7) // 8
+
+
+def _decode_adam7(
+    raw: memoryview, ihdr: Ihdr, layout: list[tuple[range, range, int]]
+) -> list[list[int]]:
     """Adam7-Paesse entzerren -> Sample-Matrix (Hoehe x Breite*Kanaele).
 
     Jeder Pass ist ein eigenes Mini-Bild: eigener Zeilenschritt, eigene
@@ -499,30 +511,16 @@ def _decode_adam7(raw: bytes, ihdr: Ihdr) -> list[list[int]]:
     width, height, depth = ihdr.width, ihdr.height, ihdr.bit_depth
     matrix: list[list[int]] = [[0] * (width * ch) for _ in range(height)]
     pos = 0
-    for pass_no, (y0, x0, ystep, xstep) in enumerate(ADAM7_PASSES, start=1):
-        pw = (width - x0 + xstep - 1) // xstep
-        ph = (height - y0 + ystep - 1) // ystep
-        if pw <= 0 or ph <= 0:
-            continue
-        stride = (pw * depth * ch + 7) // 8
-        needed = ph * (stride + 1)
-        if pos + needed > len(raw):
-            raise PngFormatError(
-                f"IDAT-Rohdaten abgeschnitten: Pass {pass_no} braucht {needed} "
-                f"Bytes, nur {len(raw) - pos} übrig"
-            )
-        pass_rows = _unfilter_rows(raw[pos : pos + needed], stride, bpp(depth, ch), ph)
-        pos += needed
-        for j, pass_row in enumerate(pass_rows):
-            samples = _expand_samples(pass_row, pw * ch, depth)
-            y = y0 + j * ystep
-            for i in range(pw):
-                x = x0 + i * xstep
-                matrix[y][x * ch : (x + 1) * ch] = samples[i * ch : (i + 1) * ch]
-    if pos != len(raw):
-        raise PngFormatError(
-            f"IDAT-Rohdaten: {len(raw) - pos} überschüssige Bytes nach Pass 7"
+    for ys, xs, stride in layout:
+        needed = len(ys) * (stride + 1)
+        pass_rows = _unfilter_rows(
+            raw[pos : pos + needed], stride, bpp(depth, ch), len(ys)
         )
+        pos += needed
+        for y, pass_row in zip(ys, pass_rows):
+            samples = _expand_samples(pass_row, len(xs) * ch, depth)
+            for i, x in enumerate(xs):
+                matrix[y][x * ch : (x + 1) * ch] = samples[i * ch : (i + 1) * ch]
     return matrix
 
 
@@ -545,8 +543,41 @@ def _expand_samples(row: bytes, count: int, depth: int) -> list[int]:
 # --------------------------------------------------------------------------
 
 
-def decode_png(data: bytes, *, verify_crc: bool = True) -> PngImage:
-    """PNG-Bytes komplett dekodieren (Format -> Bild)."""
+def _inflate_idats(idats: list[bytes], expected: int) -> memoryview:
+    if expected >= sys.maxsize:
+        raise PngUnsupportedError("IDAT-Rohdaten zu groß für diese Plattform")
+    stream = zlib.decompressobj()
+    parts: list[bytes] = []
+    size = 0
+    try:
+        for chunk in idats:
+            # Ein zusätzliches Byte unterscheidet die exakte Länge von Überlauf.
+            part = stream.decompress(chunk, expected - size + 1)
+            size += len(part)
+            if size > expected:
+                raise PngFormatError(f"IDAT-Rohdaten: mehr als {expected} Bytes")
+            if stream.unused_data:
+                raise PngFormatError("IDAT: überschüssige Bytes nach dem zlib-Stream")
+            if part:
+                parts.append(part)
+    except zlib.error as exc:
+        raise PngFormatError(f"IDAT: deflate-Daten sind korrupt ({exc})") from exc
+    if not stream.eof:
+        raise PngFormatError("IDAT: zlib-Stream abgeschnitten")
+    if size < expected:
+        raise PngFormatError(
+            f"IDAT-Rohdaten abgeschnitten: {size} Bytes, "
+            f"erwartet {expected} Bytes für alle Scanlines"
+        )
+    return memoryview(b"".join(parts))
+
+
+def decode_png(
+    data: bytes, *, verify_crc: bool = True, max_pixels: int = DEFAULT_MAX_PIXELS
+) -> PngImage:
+    """PNG-Bytes komplett dekodieren, mit einer Obergrenze für die Pixelzahl."""
+    if max_pixels < 1:
+        raise ValueError("max_pixels muss mindestens 1 sein")
     chunks = read_chunks(data, verify_crc=verify_crc)
     if chunks[0].type_name != "IHDR":
         raise PngFormatError(
@@ -557,6 +588,9 @@ def decode_png(data: bytes, *, verify_crc: bool = True) -> PngImage:
             f"Letzter Chunk ist {chunks[-1].type_name}, aber muss IEND sein"
         )
     ihdr = _parse_ihdr(chunks[0])
+    pixels = ihdr.width * ihdr.height
+    if pixels > max_pixels:
+        raise PngUnsupportedError(f"Bild hat {pixels} Pixel, Limit ist {max_pixels}")
     palette, trns, text, idats = _split_middle_chunks(chunks, ihdr)
     if ihdr.color_type == 3 and palette is None:
         raise PngFormatError("Farbart Palette braucht einen PLTE-Chunk, keiner da")
@@ -564,19 +598,11 @@ def decode_png(data: bytes, *, verify_crc: bool = True) -> PngImage:
         raise PngFormatError(
             "Kein IDAT-Chunk: ohne Bild-Daten ist das kein lesbares PNG"
         )
-    try:
-        stream = zlib.decompressobj()
-        raw = stream.decompress(b"".join(idats)) + stream.flush()
-    except zlib.error as exc:
-        raise PngFormatError(f"IDAT: deflate-Daten sind korrupt ({exc})") from exc
-    if stream.unused_data:
-        raise PngFormatError(
-            f"IDAT: {len(stream.unused_data)} überschüssige Bytes nach dem zlib-Stream"
-        )
-
     ch = CHANNELS_PER_COLOR_TYPE[ihdr.color_type]
     if ihdr.interlace == 1:
-        matrix = _decode_adam7(raw, ihdr)
+        layout = list(_adam7_layout(ihdr))
+        expected = sum(len(ys) * (stride + 1) for ys, _, stride in layout)
+        matrix = _decode_adam7(_inflate_idats(idats, expected), ihdr, layout)
         if ihdr.color_type == 3:
             _validate_palette_indices(palette, matrix)
         return PngImage(
@@ -591,12 +617,7 @@ def decode_png(data: bytes, *, verify_crc: bool = True) -> PngImage:
     stride = (ihdr.width * ihdr.bit_depth * ch + 7) // 8
     byte_pp = bpp(ihdr.bit_depth, ch)
     expected = ihdr.height * (stride + 1)
-    if len(raw) != expected:
-        raise PngFormatError(
-            f"IDAT-Rohdaten falsch: {len(raw)} Bytes, erwartet {expected} "
-            f"({ihdr.height} Scanlines à {stride + 1} Bytes mit Filterbyte)"
-        )
-    rows = _unfilter_rows(raw, stride, byte_pp, ihdr.height)
+    rows = _unfilter_rows(_inflate_idats(idats, expected), stride, byte_pp, ihdr.height)
     if ihdr.color_type == 3:
         # Pixel-Indizes gegen die reale Palettenlaenge pruefen, sonst wuerde
         # erst iter_rgba() mit rohem IndexError abstuerzen.
@@ -629,11 +650,13 @@ def _validate_palette_indices(
                 )
 
 
-def load(path: str, *, verify_crc: bool = True) -> PngImage:
+def load(
+    path: str, *, verify_crc: bool = True, max_pixels: int = DEFAULT_MAX_PIXELS
+) -> PngImage:
     """PNG-Datei lesen und dekodieren."""
     with open(path, "rb") as fh:
         data = fh.read()
-    return decode_png(data, verify_crc=verify_crc)
+    return decode_png(data, verify_crc=verify_crc, max_pixels=max_pixels)
 
 
 def write_ppm(img: PngImage, path: str) -> None:
@@ -664,6 +687,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--no-crc", action="store_true", help="CRC32-Prüfung abschalten"
     )
+    parser.add_argument(
+        "--max-pixels",
+        metavar="N",
+        type=int,
+        default=DEFAULT_MAX_PIXELS,
+        help="Maximale Pixelzahl (Standard: %(default)s)",
+    )
     args = parser.parse_args(argv)
 
     # argparse-Attribute sind Any -> hier einmal auf die deklarierten Typen
@@ -672,9 +702,12 @@ def main(argv: list[str] | None = None) -> int:
     no_crc = cast(bool, args.no_crc)
     pixels = cast("int | None", args.pixels)
     ppm = cast("str | None", args.ppm)
+    max_pixels = cast(int, args.max_pixels)
+    if max_pixels < 1:
+        parser.error("--max-pixels muss mindestens 1 sein")
 
     try:
-        img = load(path, verify_crc=not no_crc)
+        img = load(path, verify_crc=not no_crc, max_pixels=max_pixels)
     except (PngError, OSError) as exc:
         print(f"FEHLER: {exc}", file=sys.stderr)
         return 1

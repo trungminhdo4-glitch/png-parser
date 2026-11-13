@@ -31,8 +31,14 @@ tRNS, tEXt, CRC32-Prüfung.
 python pngparser.py bild.png                 # Info + Chunktabelle + CRC-Status
 python pngparser.py bild.png --ppm out.ppm   # in PPM (P6) exportieren
 python pngparser.py bild.png --pixels 8      # erste 8 Pixel zeigen
+python pngparser.py bild.png --max-pixels 25000000  # größere Bilder zulassen
 python pngparser.py bild.png --no-crc        # CRC aus (Fehlersuche)
 ```
+
+Standardmäßig akzeptiert der Decoder bis zu 16.000.000 Pixel. Das Limit lässt
+sich in der CLI mit `--max-pixels` und in `load()` oder `decode_png()` mit
+`max_pixels=` ändern. Es gilt für die Pixelzahl. Der gesamte Speicherbedarf
+hängt auch von Farbart, Bittiefe und Interlace ab.
 
 ## Das Know-how — PNG-Dateistruktur Byte je Byte
 
@@ -59,9 +65,11 @@ Beispiel `tEXt`: `t` klein → nebengeordnet, `E` groß → öffentlich,
 Kompression, Filtermethode, Interlace.** Erlaubte Bittiefen je Farbart
 (Spec-Tabelle 11.1). Kanäle pro Pixel: 0→1, 2→3, 3→1, 4→2, 6→4.
 
-**4. IDATs:** konsekutive Chunk-Daten konkatenieren, `zlib.decompress`.
+**4. IDATs:** konsekutive Chunk-Daten einem gemeinsamen zlib-Decoder zuführen.
 Erwartete Größe: `Höhe × (1 + stride)` mit `stride = ⌈Breite·Bittiefe·Kanäle / 8⌉` —
-vor jeder Zeile sitzt 1 Filterbyte.
+vor jeder Zeile sitzt 1 Filterbyte. Bei Adam7 werden die Zeilen der einzelnen
+Pässe getrennt berechnet. Der Decoder bricht bei einem zusätzlichen Rohbyte ab
+und verlangt einen vollständigen zlib-Stream.
 
 **5. Filter (Spec 9.2) — die Falle, 3× abgegangen:**
 Filter arbeiten auf **Bytes**, aber „links" meint das **Pixel** links, d. h.
