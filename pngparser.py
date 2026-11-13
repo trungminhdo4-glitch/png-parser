@@ -227,38 +227,44 @@ class PngImage:
         """
         depth = self.bit_depth
         ch = self.channels
+        ct = self.color_type
+        max_v = (1 << depth) - 1
 
         def scale(v: int) -> int:
+            if depth == 8:
+                return v
             if depth == 16:
                 return v >> 8
-            max_v = (1 << depth) - 1
             return v * 255 // max_v
 
-        trns = self.trns
+        trns = self.trns or b""
+        gray_key = int.from_bytes(trns, "big") if trns and ct == 0 else None
+        rgb_key = struct.unpack(">3H", trns) if trns and ct == 2 else None
         for row_samples in self._iter_sample_rows():
-            for px in range(self.width):
-                s = row_samples[px * ch : (px + 1) * ch]
-                ct = self.color_type
+            for index in range(0, self.width * ch, ch):
+                first = row_samples[index]
                 if ct == 0:
-                    g = scale(s[0])
-                    a = 0 if trns and int.from_bytes(trns[:2], "big") == s[0] else 255
-                    yield (g, g, g, a)
+                    g = scale(first)
+                    yield (g, g, g, 0 if first == gray_key else 255)
                 elif ct == 2:
-                    r, g, b = (scale(x) for x in s)
-                    equal = trns and tuple(s) == struct.unpack(">3H", trns[:6])
-                    yield (r, g, b, 0 if equal else 255)
+                    green, blue = row_samples[index + 1], row_samples[index + 2]
+                    alpha = 0 if rgb_key and (first, green, blue) == rgb_key else 255
+                    yield (scale(first), scale(green), scale(blue), alpha)
                 elif ct == 3:
                     assert self.palette is not None
-                    r, g, b = self.palette[s[0]]
-                    a = trns[s[0]] if trns and s[0] < len(trns) else 255
+                    r, g, b = self.palette[first]
+                    a = trns[first] if first < len(trns) else 255
                     yield (r, g, b, a)
                 elif ct == 4:
-                    g = scale(s[0])
-                    a = scale(s[1])
-                    yield (g, g, g, a)
+                    g = scale(first)
+                    yield (g, g, g, scale(row_samples[index + 1]))
                 else:
-                    r, g, b, a = (scale(x) for x in s)
-                    yield (r, g, b, a)
+                    yield (
+                        scale(first),
+                        scale(row_samples[index + 1]),
+                        scale(row_samples[index + 2]),
+                        scale(row_samples[index + 3]),
+                    )
 
     def to_rgba_rows(self) -> list[list[tuple[int, int, int, int]]]:
         """Alle Zeilen als Liste von (r, g, b, a)-Tupeln."""
