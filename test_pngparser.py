@@ -813,6 +813,25 @@ class IoAndExportTests(unittest.TestCase):
         self.assertIn("FEHLER: PPM-Export", err.getvalue())
         self.assertNotIn("Exportiert nach", out.getvalue())
 
+    def test_cli_export_preserves_source_when_destination_is_the_input(self) -> None:
+        data = encode_png(1, 1, 8, 2, rows=[bytes((1, 2, 3))])
+        for flag, format_name in (("--ppm", "PPM"), ("--pam", "PAM")):
+            with self.subTest(flag=flag), tempfile.TemporaryDirectory() as tmp:
+                source = os.path.join(tmp, "source.png")
+                subdir = os.path.join(tmp, "subdir")
+                os.mkdir(subdir)
+                target = os.path.join(subdir, "..", "source.png")
+                with open(source, "wb") as fh:
+                    fh.write(data)
+                out, err = io.StringIO(), io.StringIO()
+                with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                    code = pngparser.main([source, flag, target])
+                with open(source, "rb") as fh:
+                    self.assertEqual(fh.read(), data)
+                self.assertEqual(code, 1)
+                self.assertIn(f"FEHLER: {format_name}-Export", err.getvalue())
+                self.assertNotIn("Exportiert nach", out.getvalue())
+
     def test_idat_junk_after_zlib_stream_raises(self) -> None:
         # zlib.decompress() verwirft trailing Bytes kommentarlos; ein strenger
         # Parser meldet sie (Spec: zlib-Stream endet am IDAT-Ende).

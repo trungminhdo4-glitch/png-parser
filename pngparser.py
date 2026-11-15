@@ -24,10 +24,12 @@ CLI:
 from __future__ import annotations
 
 import argparse
+import os
 import struct
 import sys
 import zlib
 from collections.abc import Iterator
+from contextlib import suppress
 from dataclasses import dataclass
 from itertools import islice
 from typing import BinaryIO, cast
@@ -776,6 +778,9 @@ def main(argv: list[str] | None = None) -> int:
     if destination is not None:
         writer, format_name = (write_pam, "PAM") if pam is not None else (write_ppm, "PPM")
         try:
+            with suppress(FileNotFoundError):
+                if os.path.samefile(path, destination):
+                    raise OSError("Eingabe und Exportziel sind dieselbe Datei")
             writer(img, destination)
         except OSError as exc:
             print(f"FEHLER: {format_name}-Export nach {destination}: {exc}", file=sys.stderr)
