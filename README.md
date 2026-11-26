@@ -150,11 +150,25 @@ aus der Spec (jede Zelle genau einmal).
 - [ ] Gegenprobe gegen Pillow über 1000 Zufalls-PNGs (wenn offline-Vorinstall)
 - [ ] Weiter in der RE-Liste: ZIP-Dateiformat als nächste Übung (Nr. 2)
 
+## Tests
+
+Python 3.10 oder neuer; es sind keine zusätzlichen Pakete erforderlich:
+
+```sh
+python -m unittest discover -s . -p "test_*.py" -v
+```
+
+Die Fixtures entstehen im Test selbst. Der Testlauf benötigt weder Downloads
+noch externe Bilddateien. [GitHub Actions](https://github.com/trungminhdo4-glitch/png-parser/actions/workflows/tests.yml)
+führt die Suite bei Pushes und Pull Requests unter Linux und Windows mit
+Python 3.10, 3.12 und 3.14 aus. Checkout und Python-Einrichtung benötigen im
+CI-Job Netzwerkzugriff; die Tests selbst laufen offline.
+
 ## Status (FACT / IMPLEMENTED / TESTED)
 
 - IMPLEMENTED: Decoder (alle Farbarten/Bittiefen, non-interlaced UND Adam7),
   CRC-Check, tRNS/tEXt, PPM-Export, CLI, Review-Fixes (doppelte PLTE/tRNS
   abgelehnt, Paletten-Index-Bounds, CLI fängt auch OSError).
-- TESTED: 58/58 unittests (`python -m unittest test_pngparser`), ruff clean,
-  basedpyright 0 Errors / 0 Warnungen, CLI-Feldtest mit generiertem sowie
-  gezielt korruptiertem PNG (CRC-Fehler-Fall: Exit 1, Fehler auf stderr).
+- TESTED: 67/67 Unittests lokal mit Python 3.12.10 unter Windows. Die oben
+  verlinkten CI-Läufe zeigen die Ergebnisse der weiteren Plattformen und
+  Python-Versionen.
