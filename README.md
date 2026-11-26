@@ -1,174 +1,102 @@
-# png-parser — PNG von Hand durchleuchten (nur stdlib)
+# png-parser
 
-Ein PNG-**Decoder** von Grund auf: Signatur → Chunks → CRC32 → zlib →
-Scanlines entzerren (Filter) → Pixel. Keine Bildbibliothek, 0 Dependencies,
-offline — gebaut als Reverse-Engineering-Übung für das eigene Formatverständnis.
+Inspect and decode PNG files using only the Python standard library. The parser
+exposes chunks, CRC status, image metadata and decoded pixels, so developers can
+understand a file or investigate corruption without a separate image library.
+It is an educational decoder and inspection tool, not a general image editor.
 
-| Datei | Inhalt |
-| --- | --- |
-| `pngparser.py` | Parser + PPM-Export + CLI (`python pngparser.py bild.png`) |
-| `test_pngparser.py` | Unittests mit eigenem Mini-Encoder als Fixture-Generator |
-| `pyrightconfig.json` | basedpyright-Konfig (zwei Strikt-Regeln gedämpft) |
-| `LICENSE` | MIT |
+## Quickstart
 
-## Konzeptide
+Python 3.10 or newer is required. No package installation or network access is
+needed to run the parser or its tests:
 
-```python
-img = decode_png(data)                        # oder load("bild.png")
-img.width, img.height, img.color_type_name    # z. B. ("RGB", "Palette", …)
-next(img.iter_rgba())                         # (r, g, b, a) in Rasterreihenfolge
-img.raw_rows()                                # unfilterte Scanlines für Roh-Analyse
-img.save_ppm("out.ppm")                       # ohne Lib sichtbar machen
+```bash
+python pngparser.py --help
+python -m unittest discover -s . -p "test_*.py" -v
+python pngparser.py image.png --pixels 8
+python pngparser.py image.png --pam image.pam
 ```
 
-Unterstützt: Farbarten 0/2/3/4/6, Bittiefen 1/2/4/8/16, alle 5 Filtertypen,
-**Adam7-Interlace** (7 Pässe, pass-lokaler Filterkontext), mehrfache IDATs,
-tRNS, tEXt, CRC32-Prüfung.
+Replace `image.png` with a local PNG. PAM preserves the decoded alpha channel;
+PPM exports RGB and drops alpha. Both exports write pixel data in blocks.
+
+## Supported features
+
+- Grayscale, RGB, indexed color, grayscale with alpha, and RGBA (types 0/2/3/4/6).
+- Valid 1/2/4/8/16-bit combinations, all five scanline filters, and Adam7 interlace.
+- Consecutive IDAT chunks, CRC32 checking, palette transparency (`tRNS`), and
+  uncompressed Latin-1 text (`tEXt`).
+- PPM (P6) and PAM (P7 RGBA) export; output samples are 8-bit per channel.
+- Independent configurable limits for input bytes and pixel count.
 
 ## CLI
 
-```
-python pngparser.py bild.png                 # Info + Chunktabelle + CRC-Status
-python pngparser.py bild.png --ppm out.ppm   # in PPM (P6) exportieren
-python pngparser.py bild.png --pam out.pam   # in PAM (P7) mit Alphakanal exportieren
-python pngparser.py bild.png --pixels 8      # erste 8 Pixel zeigen
-python pngparser.py bild.png --max-pixels 25000000  # größere Bilder zulassen
-python pngparser.py bild.png --no-crc        # CRC aus (Fehlersuche)
-```
-
-Standardmäßig akzeptiert der Decoder bis zu 16.000.000 Pixel. Das Limit lässt
-sich in der CLI mit `--max-pixels` und in `load()` oder `decode_png()` mit
-`max_pixels=` ändern. Es gilt für die Pixelzahl. Der gesamte Speicherbedarf
-hängt auch von Farbart, Bittiefe und Interlace ab.
-
-PAM schreibt vier 8-Bit-Kanäle pro Pixel und übernimmt die Transparenz
-aus dem Alphakanal oder aus `tRNS`. Der Export ist auch über
-`img.save_pam("out.pam")` verfügbar. Beide Exportformate schreiben das
-Raster in Blöcken.
-
-## Das Know-how — PNG-Dateistruktur Byte je Byte
-
-**1. Signatur (8 Bytes): `89 50 4E 47 0D 0A 1A 0A`.**
-`0x89` = oberstes Bit gesetzt (ausgedachter Magie-Wert, fängt 7-Bit-Kanäle),
-`PNG` als ASCII, `\r\n` fängt DOS-Text/Binary-Verwechslung ab,
-`\x1a` hält Unix `cat` an, `\n` fängt Unix-Roundtrip-Verwechslung ab.
-
-**2. Chunks: `Länge (4 BE) + Typ (4 ASCII) + Daten + CRC32`.**
-Big-Endian, Länge zählt nur die Daten. Der Typ sind 4 ASCII-Buchstaben;
-je Bit 5 (Wert 1 = Kleinbuchstabe) ist ein Flag:
-
-| Buchstabe | Bedeutung |
-| --- | --- |
-| 1. | groß = kritisch (Pflicht-Chunks), klein = nebengeordnet |
-| 2. | groß = öffentlich, klein = privat (nutzerspezifisch) |
-| 3. | muss groß sein — reserviert |
-| 4. | klein = safe-to-copy (darf bei Feature-Sicherung erhalten bleiben) |
-
-Beispiel `tEXt`: `t` klein → nebengeordnet, `E` groß → öffentlich,
-`X` groß → reserviert ✓, `t` klein → safe-to-copy.
-
-**3. IHDR (13 Bytes): `<IIBBBBB` = Breite, Höhe, Bittiefe, Farbart,
-Kompression, Filtermethode, Interlace.** Erlaubte Bittiefen je Farbart
-(Spec-Tabelle 11.1). Kanäle pro Pixel: 0→1, 2→3, 3→1, 4→2, 6→4.
-
-**4. IDATs:** konsekutive Chunk-Daten einem gemeinsamen zlib-Decoder zuführen.
-Erwartete Größe: `Höhe × (1 + stride)` mit `stride = ⌈Breite·Bittiefe·Kanäle / 8⌉` —
-vor jeder Zeile sitzt 1 Filterbyte. Bei Adam7 werden die Zeilen der einzelnen
-Pässe getrennt berechnet. Der Decoder bricht bei einem zusätzlichen Rohbyte ab
-und verlangt einen vollständigen zlib-Stream.
-
-**5. Filter (Spec 9.2) — die Falle, 3× abgegangen:**
-Filter arbeiten auf **Bytes**, aber „links" meint das **Pixel** links, d. h.
-`x − bpp` mit `bpp = max(1, ⌈Bittiefe·Kanäle / 8⌉)` — das gleiche Kanal-Byte
-des Nachbarpixels, NICHT das Nachbar-Byte!
-
-| Typ | Name | Recon = Filt + … |
-| --- | --- | --- |
-| 0 | None | — |
-| 1 | Sub | `Raw(x − bpp)` (Links-Pixel, 0 wenn x < bpp) |
-| 2 | Up | `Prior(x)` (Pixel oben, 0 in Zeile 0) |
-| 3 | Average | `⌊(Raw(x − bpp) + Prior(x)) / 2⌋` |
-| 4 | Paeth | nächster von a/b/c zu `p = a + b − c` |
-
-Paeth-Wahlregel präzise: `pa = |p−a|, pb = |p−b|, pc = |p−c|`
-→ `a` wenn `pa ≤ pb` **und** `pa ≤ pc`, sonst `b` wenn `pb ≤ pc`, sonst `c`.
-Lern-Fall: vorletztes Byte `a=0, b=10, c=0` — `p=10`, `pb=0` minimal → **b** gewinnt!
-
-**6. Sub-byte-Bittiefen (1/2/4):** mehrere Pixel teilen sich ein Byte,
-**MSB zuerst**, Zeile auf Ganzes Byte aufgefüllt. Für Anzeige skalieren:
-`Wert × 255 // max` (max = 2^Bittiefe − 1); 16 Bit → `>> 8`.
-
-**7. tRNS:** Grau (2 B) / RGB (6 B) = Schlüsselfarbe auf **RAW-Ebene**
-(vor Skalierung) vergleichen; Palette = Alpha-Bytes je Palette-Index (≤ PLTE-Größe).
-
-**8. Adam7-Interlace (RFC 2083, 2.6):** 7 Pässe über ein 8×8-Raster:
-
-| Pass | (Startz, Starts, Zeilenschritt, Spaltenschritt) |
-| --- | --- |
-| 1 | (0, 0, 8, 8) |
-| 2 | (0, 4, 8, 8) |
-| 3 | (4, 0, 8, 4) — Spaltenschritt **4**, nicht 8 |
-| 4 | (0, 2, 4, 4) |
-| 5 | (2, 0, 4, 2) |
-| 6 | (0, 1, 2, 2) |
-| 7 | (1, 0, 2, 1) — *alle* Spalten der ungeraden Zeilen |
-
-Jeder Pass ist ein eigenes Mini-Bild: eigene Pass-Breite/-Höhe (⌈-Formeln),
-eigene Filterbytes, **pass-lokaler Filterkontext** (Prev-Zeile = vorherige
-Zeile desselben Passes), und Pass-Zeilen werden separat auf Ganzes Byte
-gepolstert. Leere Pässe (unter 5 Spalten/Zeilen) tragen keine Filterbytes.
-Der Decoder prüft die Pass-Tabelle per Property-Test gegen das 8×8-Grid
-aus der Spec (jede Zelle genau einmal).
-
-## Fehlerkanäle (alle mit deutlicher deutscher Meldung)
-
-- falsche Signatur, abgeschnittene Chunks, CRC-Mismatch (mit gespeichert/berechnet)
-- IHDR nicht am Anfang / IEND nicht am Ende / Daten nach IEND
-- IDAT: nicht konsekutiv, deflate korrupt, falsche Rohdatenlänge
-- unlautere Farbart/Bittiefe-Kombi, fehlerhafte PLTE (kein Vielfaches von 3,
-  zu viele Einträge, verboten bei Graustufen)
-- doppelte PLTE/tRNS (Spec: darf nur einmal vorkommen)
-- tRNS nach IDAT, PLTE nach tRNS, IEND mit Nutzdaten und unbekannte kritische Chunks
-- Paletten-Index hinter der PLTE-Länge (bricht mit Meldung, nicht mit IndexError)
-- überschüssige Bytes nach dem zlib-Stream im IDAT (stdlib verwirft sie still)
-
-## 3 Fallen, die dieser Testlauf gelehrt hat (TESTED)
-
-1. **`bytes((x))` ≠ `bytes((x,))`** — ohne Komma ist `bytes(int)` ein
-   *Längen*-Konstruktor: `bytes(160)` = 160 Null-Bytes! Kostete 4 Errors.
-2. **bpp-Filter-Falle** oben („links" = Pixel, nicht Byte) — Sub/Average/
-   Paeth-Fixtures waren zunächst falsch handgerechnet.
-3. **Paeth-Gleichstand:** `a` gewinnt (`pa ≤ pb` bindet), nicht `b`.
-
-## Übungsaufgaben (nächste Ebene)
-
-- [x] Adam7-Interlace (IMPLEMENTED + TESTED: Property-Test gegen Spec-Grid,
-  Roundtrips für Farbarten/Bittiefen, pass-lokaler Filterkontext)
-- [ ] PNG-**Writer** mit Filter-Optimalwahl (beste Filtertypen pro Zeile messen)
-- [ ] Chunk-Writer (tEXt anpassen, ohne Bildbits zu berühren); BMP-Export
-- [ ] Fuzzing: Byte-Flip-Loop automatisieren (Kaputt-Muster aus `kaputt.png`)
-- [ ] Gegenprobe gegen Pillow über 1000 Zufalls-PNGs (wenn offline-Vorinstall)
-- [ ] Weiter in der RE-Liste: ZIP-Dateiformat als nächste Übung (Nr. 2)
-
-## Tests
-
-Python 3.10 oder neuer; es sind keine zusätzlichen Pakete erforderlich:
-
-```sh
-python -m unittest discover -s . -p "test_*.py" -v
+```bash
+python pngparser.py image.png                  # Metadata, chunks and CRC status
+python pngparser.py image.png --ppm image.ppm   # RGB export
+python pngparser.py image.png --pam image.pam   # RGBA export
+python pngparser.py image.png --pixels 8        # First eight RGBA pixels
+python pngparser.py image.png --max-pixels 25000000
+python pngparser.py image.png --max-input-bytes 134217728
+python pngparser.py image.png --no-crc          # Diagnostic use only
 ```
 
-Die Fixtures entstehen im Test selbst. Der Testlauf benötigt weder Downloads
-noch externe Bilddateien. [GitHub Actions](https://github.com/trungminhdo4-glitch/png-parser/actions/workflows/tests.yml)
-führt die Suite bei Pushes und Pull Requests unter Linux und Windows mit
-Python 3.10, 3.12 und 3.14 aus. Checkout und Python-Einrichtung benötigen im
-CI-Job Netzwerkzugriff; die Tests selbst laufen offline.
+A decode or file error returns exit code 1 and writes a diagnostic to stderr.
+Invalid CLI arguments return 2. Resource-limit errors occur before any export
+file is opened. Existing export files are otherwise overwritten; export writes
+are not atomic.
 
-## Status (FACT / IMPLEMENTED / TESTED)
+## Python API
 
-- IMPLEMENTED: Decoder (alle Farbarten/Bittiefen, non-interlaced UND Adam7),
-  CRC-Check, tRNS/tEXt, PPM-Export, CLI, Review-Fixes (doppelte PLTE/tRNS
-  abgelehnt, Paletten-Index-Bounds, CLI fängt auch OSError).
-- TESTED: 67/67 Unittests lokal mit Python 3.12.10 unter Windows. Die oben
-  verlinkten CI-Läufe zeigen die Ergebnisse der weiteren Plattformen und
-  Python-Versionen.
+```python
+from pngparser import load
+
+image = load("image.png", max_pixels=16_000_000, max_input_bytes=67_108_864)
+print(image.width, image.height, image.bit_depth, image.color_type_name)
+print(next(image.iter_rgba()))
+image.save_pam("image.pam")
+```
+
+`decode_png(data, ...)` accepts the same keyword limits for bytes already held by
+the caller. `PngFormatError` indicates invalid PNG structure or data;
+`PngUnsupportedError` includes files exceeding configured limits. Invalid
+`max_input_bytes` values raise `ValueError`; it must be a positive integer.
+
+## Resource and validation model
+
+The defaults are **64 MiB of PNG input** and **16,000,000 pixels**. Small images
+can contain large metadata chunks, so a pixel limit alone does not bound file
+input. `load()` reads at most the byte limit plus one detection byte, even if a
+file grows after opening. `decode_png()` rejects excess bytes before parsing or
+copying chunks. Raise `max_input_bytes` or `--max-input-bytes` deliberately when
+inspecting larger files. This is an application policy, not a PNG validity rule.
+
+These limits do **not** cap total process memory or CPU time. The decoder retains
+chunks and reconstructed image data; Python sample lists, especially Adam7 and
+16-bit images, can consume substantially more memory than their input. The
+low-level `read_chunks()` helper has no input limit. Use OS-level resource limits
+or process isolation when inspecting untrusted files in a service.
+
+CRC checks are enabled by default. The parser also checks chunk order, duplicate
+palette/transparency chunks, unknown critical chunks, palette indices, scanline
+lengths, and complete zlib streams. Disabling CRC does not disable resource
+limits. Color management, compressed/international text, animation, and PNG
+encoding are not implemented. Samples are inspected without color correction;
+16-bit samples are reduced to their high byte for RGBA iteration/export.
+
+## Architecture and tests
+
+`pngparser.py` follows the file structure: signature → chunks/CRC → IHDR →
+IDAT inflation → filter reconstruction → pixel iteration/export. Adam7 decodes
+seven passes with a separate filter context per pass. See the
+[W3C PNG specification](https://www.w3.org/TR/png-3/) for chunk and image layout.
+
+`test_pngparser.py` contains a synthetic PNG encoder and offline tests for color
+and bit-depth combinations, filters, Adam7, malformed files, resource limits,
+and exports. Run the command in Quickstart. The [test workflow](.github/workflows/tests.yml)
+runs the suite on Linux and Windows with Python 3.10, 3.12 and 3.14. Tests use
+local generated fixtures; they are not an exhaustive PNG conformance suite.
+
+## License
+
+MIT; see [LICENSE](LICENSE).

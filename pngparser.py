@@ -18,7 +18,7 @@ Beispiel:
     img.save_ppm("bild.ppm")   # ohne Lib anschau- und editierbar machen
 
 CLI:
-    python pngparser.py bild.png [--ppm out.ppm | --pam out.pam] [--pixels N] [--max-pixels N] [--no-crc]
+    python pngparser.py bild.png [--ppm out.ppm | --pam out.pam] [--pixels N] [--max-pixels N] [--max-input-bytes N] [--no-crc]
 """
 
 from __future__ import annotations
@@ -36,6 +36,7 @@ from typing import BinaryIO, cast
 
 SIGNATURE = b"\x89PNG\r\n\x1a\n"
 DEFAULT_MAX_PIXELS = 16_000_000
+DEFAULT_MAX_INPUT_BYTES = 64 * 1024 * 1024
 
 #: Farbart -> Anzahl Samples pro Pixel (PNG-Spec, Tabelle 11.1)
 CHANNELS_PER_COLOR_TYPE = {0: 1, 2: 3, 3: 1, 4: 2, 6: 4}
@@ -80,7 +81,7 @@ class PngFormatError(PngError):
 
 
 class PngUnsupportedError(PngError):
-    """Gültige PNG-Datei, aber dieses Modul kann das Feature nicht lesen (z. B. Adam7)."""
+    """PNG data exceeds a supported feature or configured resource limit."""
 
 
 def bpp(bit_depth: int, channels: int) -> int:
@@ -588,10 +589,25 @@ def _inflate_idats(idats: list[bytes], expected: int) -> memoryview:
     return memoryview(b"".join(parts))
 
 
+def _validate_input_byte_limit(max_input_bytes: object) -> None:
+    if isinstance(max_input_bytes, bool) or not isinstance(max_input_bytes, int) or max_input_bytes < 1:
+        raise ValueError("max_input_bytes muss eine positive ganze Zahl sein")
+
+
 def decode_png(
-    data: bytes, *, verify_crc: bool = True, max_pixels: int = DEFAULT_MAX_PIXELS
+    data: bytes, *, verify_crc: bool = True, max_pixels: int = DEFAULT_MAX_PIXELS,
+    max_input_bytes: int = DEFAULT_MAX_INPUT_BYTES,
 ) -> PngImage:
-    """PNG-Bytes komplett dekodieren, mit einer Obergrenze für die Pixelzahl."""
+    """Decode PNG bytes with independent input-byte and pixel limits.
+
+    The input limit is checked before parsing/copying chunks. It does not cap
+    total process memory or decoded pixel/sample allocations.
+    """
+    _validate_input_byte_limit(max_input_bytes)
+    if len(data) > max_input_bytes:
+        raise PngUnsupportedError(
+            f"Input hat {len(data)} Bytes, Limit ist {max_input_bytes}"
+        )
     if max_pixels < 1:
         raise ValueError("max_pixels muss mindestens 1 sein")
     chunks = read_chunks(data, verify_crc=verify_crc)
@@ -667,12 +683,17 @@ def _validate_palette_indices(
 
 
 def load(
-    path: str, *, verify_crc: bool = True, max_pixels: int = DEFAULT_MAX_PIXELS
+    path: str, *, verify_crc: bool = True, max_pixels: int = DEFAULT_MAX_PIXELS,
+    max_input_bytes: int = DEFAULT_MAX_INPUT_BYTES,
 ) -> PngImage:
-    """PNG-Datei lesen und dekodieren."""
+    """Read at most max_input_bytes + 1 bytes, then decode within the limit."""
+    _validate_input_byte_limit(max_input_bytes)
     with open(path, "rb") as fh:
-        data = fh.read()
-    return decode_png(data, verify_crc=verify_crc, max_pixels=max_pixels)
+        data = fh.read(min(max_input_bytes + 1, sys.maxsize))
+    return decode_png(
+        data, verify_crc=verify_crc, max_pixels=max_pixels,
+        max_input_bytes=max_input_bytes,
+    )
 
 
 def _write_pixel_blocks(stream: BinaryIO, pixels: Iterator[bytes]) -> None:
@@ -727,6 +748,11 @@ def main(argv: list[str] | None = None) -> int:
         default=DEFAULT_MAX_PIXELS,
         help="Maximale Pixelzahl (Standard: %(default)s)",
     )
+    parser.add_argument(
+        "--max-input-bytes", metavar="N", type=int,
+        default=DEFAULT_MAX_INPUT_BYTES,
+        help="Maximale Eingabegroesse in Bytes (Standard: %(default)s)",
+    )
     args = parser.parse_args(argv)
 
     # argparse-Attribute sind Any -> hier einmal auf die deklarierten Typen
@@ -737,11 +763,17 @@ def main(argv: list[str] | None = None) -> int:
     ppm = cast("str | None", args.ppm)
     pam = cast("str | None", args.pam)
     max_pixels = cast(int, args.max_pixels)
+    max_input_bytes = cast(int, args.max_input_bytes)
     if max_pixels < 1:
         parser.error("--max-pixels muss mindestens 1 sein")
+    if max_input_bytes < 1:
+        parser.error("--max-input-bytes muss mindestens 1 sein")
 
     try:
-        img = load(path, verify_crc=not no_crc, max_pixels=max_pixels)
+        img = load(
+            path, verify_crc=not no_crc, max_pixels=max_pixels,
+            max_input_bytes=max_input_bytes,
+        )
     except (PngError, OSError) as exc:
         print(f"FEHLER: {exc}", file=sys.stderr)
         return 1

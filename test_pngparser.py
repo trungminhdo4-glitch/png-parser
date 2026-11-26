@@ -13,7 +13,8 @@ import struct
 import tempfile
 import unittest
 import zlib
-from typing import ClassVar
+from typing import ClassVar, cast, final
+from unittest.mock import patch
 
 import pngparser
 from pngparser import (
@@ -711,6 +712,78 @@ class InterlaceTests(unittest.TestCase):
 
 class IoAndExportTests(unittest.TestCase):
     """Datei-I/O und PPM-Export (damit man das Ergebnis anschauen kann)."""
+
+    def test_input_byte_limit_accepts_exact_boundary_and_rejects_metadata(self) -> None:
+        data = encode_png(1, 1, 8, 2, rows=[b"\xff\x00\x00"])
+        self.assertEqual(decode_png(data, max_input_bytes=len(data)).width, 1)
+        with self.assertRaises(pngparser.PngUnsupportedError):
+            decode_png(data, max_input_bytes=len(data) - 1, verify_crc=False)
+        oversized = encode_png(
+            1, 1, 8, 2, rows=[b"\xff\x00\x00"],
+            extra_chunks=[(b"abCd", b"x" * 100)],
+        )
+        with (
+            patch.object(pngparser, "read_chunks", side_effect=AssertionError("parsed")),
+            self.assertRaisesRegex(pngparser.PngUnsupportedError, "Input.*Bytes.*Limit"),
+        ):
+            decode_png(oversized, max_input_bytes=len(data))
+
+    def test_load_reads_at_most_input_limit_plus_one(self) -> None:
+        data = encode_png(1, 1, 8, 2, rows=[b"\xff\x00\x00"])
+
+        @final
+        class RecordingInput:
+            sizes: list[int]
+            source: io.BytesIO
+
+            def __init__(self, content: bytes) -> None:
+                self.source = io.BytesIO(content)
+                self.sizes = []
+
+            def __enter__(self) -> RecordingInput:
+                return self
+
+            def __exit__(self, *_exc: object) -> None:
+                self.source.close()
+
+            def read(self, size: int = -1, /) -> bytes:
+                self.sizes.append(size)
+                return self.source.read(size)
+
+        stream = RecordingInput(data)
+        with patch("builtins.open", return_value=stream):
+            self.assertEqual(load("example.png", max_input_bytes=len(data)).width, 1)
+        self.assertEqual(stream.sizes, [len(data) + 1])
+
+    def test_input_limit_api_and_cli_refuse_invalid_or_oversized_inputs(self) -> None:
+        data = encode_png(1, 1, 8, 2, rows=[b"\xff\x00\x00"])
+        for limit in (0, -1, True, False, 1.5, "100", None):
+            with self.subTest(limit=limit):
+                # Deliberately test runtime callers that bypass annotations.
+                with self.assertRaisesRegex(ValueError, "max_input_bytes"):
+                    decode_png(data, max_input_bytes=cast(int, limit))
+                with self.assertRaisesRegex(ValueError, "max_input_bytes"):
+                    load("nonexistent.png", max_input_bytes=cast(int, limit))
+        for limit in (0, -1):
+            with self.subTest(cli_limit=limit):
+                with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as exc:
+                    pngparser.main(["nonexistent.png", "--max-input-bytes", str(limit)])
+                self.assertEqual(exc.exception.code, 2)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "limited.png")
+            target = os.path.join(tmp, "existing.ppm")
+            with open(path, "wb") as fh:
+                fh.write(data)
+            with open(target, "wb") as fh:
+                fh.write(b"preserved")
+            out, err = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                code = pngparser.main([path, "--max-input-bytes", str(len(data) - 1), "--ppm", target])
+            self.assertEqual(code, 1)
+            self.assertEqual(out.getvalue(), "")
+            self.assertIn("Limit", err.getvalue())
+            with open(target, "rb") as fh:
+                self.assertEqual(fh.read(), b"preserved")
 
     def test_load_from_file(self) -> None:
         data = encode_png(1, 1, 8, 2, rows=[b"\xff\x00\x00"])
